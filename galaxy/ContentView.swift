@@ -34,6 +34,7 @@ class SoundEngine {
         var chordProgression: [[Int]] = [[0, 3, 7], [5, 8, 12], [3, 7, 10], [7, 10, 14]]
         var currentChord: Int = 0
         var arpIndex: Int = 0
+        var isSadMode: Bool = false
     }
     
     private init() {
@@ -118,25 +119,34 @@ class SoundEngine {
         musicState.intensity = max(0.1, min(1.0, intensity))
     }
     
+    func setMusicSadMode(_ sad: Bool) {
+        musicState.isSadMode = sad
+        if sad {
+            musicState.intensity = 0.15  // Just lower intensity
+        }
+    }
+    
     private func playMusicBeat() {
         guard isReady, let format = format else { return }
         
+        let isSad = musicState.isSadMode
         let baseFreq = 55.0 // A1
         let beat = musicState.beat
         let chord = musicState.chordProgression[musicState.currentChord]
+        let volume = isSad ? 0.5 : 1.0  // Just quieter when sad
         
         // Bass line (every 4 beats)
         if beat % 4 == 0 {
             let bassNote = chord[0] + (musicState.currentChord * 2) % 12
             let bassFreq = baseFreq * pow(2.0, Double(bassNote) / 12.0)
-            playMusicTone(frequency: bassFreq, duration: 0.3, volume: 0.25, type: .triangle)
+            playMusicTone(frequency: bassFreq, duration: 0.3, volume: 0.25 * volume, type: .triangle)
         }
         
         // Arpeggio
         if beat % 2 == 0 {
             let arpNote = chord[musicState.arpIndex % chord.count] + 12
             let arpFreq = baseFreq * 2 * pow(2.0, Double(arpNote) / 12.0)
-            playMusicTone(frequency: arpFreq, duration: 0.12, volume: 0.15 * musicState.intensity, type: .square)
+            playMusicTone(frequency: arpFreq, duration: 0.12, volume: 0.15 * musicState.intensity * volume, type: .square)
             musicState.arpIndex += 1
         }
         
@@ -144,11 +154,11 @@ class SoundEngine {
         if Double.random(in: 0...1) < musicState.intensity * 0.3 {
             let melodyNote = musicState.scale.randomElement()! + 24 + (beat % 8 < 4 ? 0 : 2)
             let melodyFreq = baseFreq * pow(2.0, Double(melodyNote) / 12.0)
-            playMusicTone(frequency: melodyFreq, duration: 0.1, volume: 0.12 * musicState.intensity, type: .sine)
+            playMusicTone(frequency: melodyFreq, duration: 0.1, volume: 0.12 * musicState.intensity * volume, type: .sine)
         }
         
-        // Hi-hat style noise (on off-beats at high intensity)
-        if musicState.intensity > 0.5 && beat % 2 == 1 {
+        // Hi-hat style noise (on off-beats at high intensity, disabled when sad)
+        if !isSad && musicState.intensity > 0.5 && beat % 2 == 1 {
             playMusicTone(frequency: 8000, duration: 0.03, volume: 0.05, type: .noise)
         }
         
@@ -260,7 +270,7 @@ class SoundEngine {
     }
     
     func playGameOver() {
-        stopAllSounds()
+        // Music continues unchanged - just play game over sound
         let notes: [Double] = [392.00, 349.23, 329.63, 293.66]
         for (index, freq) in notes.enumerated() {
             DispatchQueue.main.asyncAfter(deadline: .now() + Double(index) * 0.2) {
@@ -582,9 +592,12 @@ class GameEngine {
     }
     
     func update(deltaTime: Double) {
-        guard gameState == .playing else { return }
-        
         gameTime += deltaTime
+        
+        // Always update visual effects (even during game over)
+        screenShake.update()
+        flashEffect.update()
+        updateParticles(deltaTime: deltaTime)
         
         // Update stars
         for i in stars.indices {
@@ -595,6 +608,9 @@ class GameEngine {
             }
             stars[i].alpha = 0.3 + 0.7 * (0.5 + 0.5 * sin(gameTime * 3 + Double(i)))
         }
+        
+        // Stop game logic if not playing
+        guard gameState == .playing else { return }
         
         // Update combo timer
         if comboTimer > 0 {
@@ -653,12 +669,7 @@ class GameEngine {
         // Update bullets
         updateBullets()
         
-        // Update particles
-        updateParticles(deltaTime: deltaTime)
-        
-        // Update effects
-        screenShake.update()
-        flashEffect.update()
+        // Note: particles and effects already updated at start of function
         
         // Update player invincibility
         if player.isInvincible {
@@ -1041,11 +1052,6 @@ class GameEngine {
         screenShake.trigger(intensity: 30)
         flashEffect.trigger(color: RetroColors.neonPink)
         SoundEngine.shared.playGameOver()
-        
-        // Massive explosion
-        for invader in invaders where invader.isAlive {
-            createExplosion(at: invader.position, intensity: 1)
-        }
     }
     
     func movePlayer(to x: CGFloat) {
