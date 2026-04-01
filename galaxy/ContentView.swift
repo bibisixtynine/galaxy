@@ -19,6 +19,22 @@ class SoundEngine {
     private var format: AVAudioFormat?
     private var isReady = false
     
+    // Music system
+    private var musicNode: AVAudioPlayerNode?
+    private var musicTimer: Timer?
+    private var musicState = MusicState()
+    
+    private struct MusicState {
+        var baseNote: Int = 0
+        var pattern: Int = 0
+        var beat: Int = 0
+        var intensity: Double = 0.3
+        var scale: [Int] = [0, 2, 3, 5, 7, 8, 10, 12] // Minor scale
+        var chordProgression: [[Int]] = [[0, 3, 7], [5, 8, 12], [3, 7, 10], [7, 10, 14]]
+        var currentChord: Int = 0
+        var arpIndex: Int = 0
+    }
+    
     private init() {
         setupAudio()
     }
@@ -47,12 +63,149 @@ class SoundEngine {
             playerNodes.append(playerNode)
         }
         
+        // Music node
+        let musicPlayerNode = AVAudioPlayerNode()
+        engine.attach(musicPlayerNode)
+        engine.connect(musicPlayerNode, to: engine.mainMixerNode, format: audioFormat)
+        musicNode = musicPlayerNode
+        
         do {
             try engine.start()
             audioEngine = engine
             isReady = true
         } catch {
             // Audio not available, game will run silently
+        }
+    }
+    
+    func startMusic() {
+        guard isReady else { return }
+        stopMusic()
+        musicState = MusicState()
+        musicNode?.play()
+        
+        // Start music loop
+        musicTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
+            self?.playMusicBeat()
+        }
+        RunLoop.main.add(musicTimer!, forMode: .common)
+    }
+    
+    func stopMusic() {
+        musicTimer?.invalidate()
+        musicTimer = nil
+        musicNode?.stop()
+    }
+    
+    func setMusicIntensity(_ intensity: Double) {
+        musicState.intensity = max(0.1, min(1.0, intensity))
+    }
+    
+    private func playMusicBeat() {
+        guard isReady, let format = format else { return }
+        
+        let baseFreq = 55.0 // A1
+        let beat = musicState.beat
+        let chord = musicState.chordProgression[musicState.currentChord]
+        
+        // Bass line (every 4 beats)
+        if beat % 4 == 0 {
+            let bassNote = chord[0] + (musicState.currentChord * 2) % 12
+            let bassFreq = baseFreq * pow(2.0, Double(bassNote) / 12.0)
+            playMusicTone(frequency: bassFreq, duration: 0.3, volume: 0.25, type: .triangle)
+        }
+        
+        // Arpeggio
+        if beat % 2 == 0 {
+            let arpNote = chord[musicState.arpIndex % chord.count] + 12
+            let arpFreq = baseFreq * 2 * pow(2.0, Double(arpNote) / 12.0)
+            playMusicTone(frequency: arpFreq, duration: 0.12, volume: 0.15 * musicState.intensity, type: .square)
+            musicState.arpIndex += 1
+        }
+        
+        // Lead melody (probabilistic, more frequent at high intensity)
+        if Double.random(in: 0...1) < musicState.intensity * 0.3 {
+            let melodyNote = musicState.scale.randomElement()! + 24 + (beat % 8 < 4 ? 0 : 2)
+            let melodyFreq = baseFreq * pow(2.0, Double(melodyNote) / 12.0)
+            playMusicTone(frequency: melodyFreq, duration: 0.1, volume: 0.12 * musicState.intensity, type: .sine)
+        }
+        
+        // Hi-hat style noise (on off-beats at high intensity)
+        if musicState.intensity > 0.5 && beat % 2 == 1 {
+            playMusicTone(frequency: 8000, duration: 0.03, volume: 0.05, type: .noise)
+        }
+        
+        // Advance beat
+        musicState.beat += 1
+        if musicState.beat >= 16 {
+            musicState.beat = 0
+            musicState.currentChord = (musicState.currentChord + 1) % musicState.chordProgression.count
+            
+            // Occasionally change pattern
+            if Int.random(in: 0..<4) == 0 {
+                musicState.scale = [
+                    [0, 2, 3, 5, 7, 8, 10, 12],  // Minor
+                    [0, 2, 4, 5, 7, 9, 11, 12],  // Major
+                    [0, 2, 3, 5, 7, 8, 11, 12],  // Harmonic minor
+                    [0, 3, 5, 6, 7, 10, 12, 15]  // Blues
+                ].randomElement()!
+            }
+        }
+    }
+    
+    private func playMusicTone(frequency: Double, duration: Double, volume: Double, type: WaveType) {
+        guard isReady, let format = format, let musicNode = musicNode else { return }
+        
+        let sampleRate = format.sampleRate
+        let channelCount = Int(format.channelCount)
+        let frameCount = Int(duration * sampleRate)
+        
+        guard frameCount > 0,
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frameCount)),
+              let channelData = buffer.floatChannelData else { return }
+        
+        buffer.frameLength = AVAudioFrameCount(frameCount)
+        
+        for frame in 0..<frameCount {
+            let time = Double(frame) / sampleRate
+            var sample: Float
+            
+            switch type {
+            case .square:
+                let phase = time * frequency
+                sample = (phase.truncatingRemainder(dividingBy: 1.0) < 0.5) ? 1.0 : -1.0
+                sample *= 0.3
+            case .noise:
+                sample = Float.random(in: -0.3...0.3)
+            case .triangle:
+                let phase = (time * frequency).truncatingRemainder(dividingBy: 1.0)
+                sample = Float(phase < 0.5 ? (4.0 * phase - 1.0) : (3.0 - 4.0 * phase))
+                sample *= 0.4
+            case .sine:
+                sample = Float(sin(time * frequency * 2 * .pi) * 0.3)
+            }
+            
+            // Envelope
+            let attack = min(1.0, Double(frame) / (sampleRate * 0.01))
+            let release = min(1.0, Double(frameCount - frame) / (sampleRate * 0.05))
+            sample *= Float(attack * release * volume)
+            
+            for channel in 0..<channelCount {
+                channelData[channel][frame] = sample
+            }
+        }
+        
+        musicNode.scheduleBuffer(buffer, at: nil, options: [], completionHandler: nil)
+    }
+    
+    func playDiveSound() {
+        // Swooping sound for dive attack
+        let startFreq = 600.0
+        for i in 0..<5 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 0.05) {
+                let freq = startFreq - Double(i) * 80
+                self.playTone(frequency: freq, duration: 0.06, type: .square, decay: true, volume: 0.2)
+            }
         }
     }
     
@@ -90,6 +243,7 @@ class SoundEngine {
     }
     
     func playGameOver() {
+        stopMusic()
         let notes: [Double] = [392.00, 349.23, 329.63, 293.66]
         for (index, freq) in notes.enumerated() {
             DispatchQueue.main.asyncAfter(deadline: .now() + Double(index) * 0.2) {
@@ -106,10 +260,10 @@ class SoundEngine {
     }
     
     private enum WaveType {
-        case square, noise
+        case square, noise, triangle, sine
     }
     
-    private func playTone(frequency: Double, duration: Double, type: WaveType, decay: Bool) {
+    private func playTone(frequency: Double, duration: Double, type: WaveType, decay: Bool, volume: Double = 1.0) {
         guard isReady, let format = format else { return }
         
         let sampleRate = format.sampleRate
@@ -136,12 +290,19 @@ class SoundEngine {
                 sample = Float.random(in: -0.4...0.4)
                 let lowFreqMod = sin(time * frequency * 2 * .pi)
                 sample *= Float(0.5 + 0.5 * lowFreqMod)
+            case .triangle:
+                let phase = (time * frequency).truncatingRemainder(dividingBy: 1.0)
+                sample = Float(phase < 0.5 ? (4.0 * phase - 1.0) : (3.0 - 4.0 * phase)) * 0.3
+            case .sine:
+                sample = Float(sin(time * frequency * 2 * .pi) * 0.3)
             }
             
             if decay {
                 let envelope = Float(1.0 - Double(frame) / Double(frameCount))
                 sample *= envelope * envelope
             }
+            
+            sample *= Float(volume)
             
             // Write to all channels (stereo compatibility)
             for channel in 0..<channelCount {
@@ -221,6 +382,17 @@ struct Particle: Identifiable {
     }
 }
 
+// MARK: - Dive Attack State
+struct DiveAttack {
+    var isDiving: Bool = false
+    var startPosition: CGPoint = .zero
+    var targetPosition: CGPoint = .zero
+    var progress: Double = 0
+    var phase: Int = 0  // 0: dive down, 1: swoop, 2: return or exit
+    var angle: Double = 0
+    var spinSpeed: Double = 0
+}
+
 // MARK: - Invader Model
 struct Invader: Identifiable {
     let id = UUID()
@@ -229,6 +401,8 @@ struct Invader: Identifiable {
     var isAlive: Bool = true
     var animationFrame: Int = 0
     var hitFlash: Double = 0
+    var gridPosition: CGPoint = .zero  // Original grid position
+    var diveAttack: DiveAttack = DiveAttack()
 }
 
 // MARK: - Bullet Model
@@ -320,6 +494,8 @@ class GameEngine {
     var lastInvaderShot: Double = 0
     var gameTime: Double = 0
     var stars: [Particle] = []
+    var lastDiveAttack: Double = 0
+    var diveAttackCooldown: Double = 8.0
     
     // Cached filtered arrays for performance
     var aliveInvaders: [Invader] { invaders.filter { $0.isAlive } }
@@ -367,6 +543,7 @@ class GameEngine {
         spawnInvaders()
         flashEffect.trigger(color: RetroColors.neonGreen)
         SoundEngine.shared.playMenuSelect()
+        SoundEngine.shared.startMusic()
     }
     
     func spawnInvaders() {
@@ -379,7 +556,9 @@ class GameEngine {
                 let x = startX + CGFloat(col) * (GameConstants.invaderSize + GameConstants.invaderSpacing)
                 let y = startY + CGFloat(row) * (GameConstants.invaderSize + GameConstants.invaderSpacing)
                 let type = row < 1 ? 2 : (row < 3 ? 1 : 0)
-                invaders.append(Invader(position: CGPoint(x: x, y: y), type: type))
+                var invader = Invader(position: CGPoint(x: x, y: y), type: type)
+                invader.gridPosition = CGPoint(x: x, y: y)
+                invaders.append(invader)
             }
         }
         invaderDirection = 1
@@ -417,7 +596,7 @@ class GameEngine {
             moveInvaders()
         }
         
-        // Animate invaders
+        // Animate invaders and update dive attacks
         for i in invaders.indices {
             if Int(gameTime * 4) % 2 == 0 {
                 invaders[i].animationFrame = (invaders[i].animationFrame + 1) % 2
@@ -425,7 +604,26 @@ class GameEngine {
             if invaders[i].hitFlash > 0 {
                 invaders[i].hitFlash -= deltaTime * 5
             }
+            
+            // Update diving invaders
+            if invaders[i].diveAttack.isDiving {
+                updateDiveAttack(index: i, deltaTime: deltaTime)
+            }
         }
+        
+        // Trigger dive attacks (less frequent)
+        lastDiveAttack += deltaTime
+        let diveInterval = max(5.0, diveAttackCooldown - Double(wave) * 0.2)
+        if lastDiveAttack >= diveInterval {
+            lastDiveAttack = 0
+            triggerDiveAttack()
+        }
+        
+        // Update music intensity based on game state
+        let aliveCount = Double(invaders.filter { $0.isAlive }.count)
+        let totalCount = Double(GameConstants.invaderRows * GameConstants.invaderCols)
+        let intensity = 0.3 + 0.7 * (1.0 - aliveCount / totalCount)
+        SoundEngine.shared.setMusicIntensity(intensity)
         
         // Invader shooting
         lastInvaderShot += deltaTime
@@ -467,10 +665,110 @@ class GameEngine {
         }
     }
     
+    func triggerDiveAttack() {
+        // Select 2-4 invaders for a group dive attack
+        let availableInvaders = invaders.indices.filter { 
+            invaders[$0].isAlive && !invaders[$0].diveAttack.isDiving 
+        }
+        guard availableInvaders.count >= 2 else { return }
+        
+        let groupSize = min(availableInvaders.count, Int.random(in: 2...4))
+        let selectedIndices = availableInvaders.shuffled().prefix(groupSize)
+        
+        SoundEngine.shared.playDiveSound()
+        
+        for (offset, index) in selectedIndices.enumerated() {
+            // Stagger the dive starts slightly
+            let delay = Double(offset) * 0.15
+            
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self = self, self.invaders.indices.contains(index) else { return }
+                
+                self.invaders[index].diveAttack.isDiving = true
+                self.invaders[index].diveAttack.startPosition = self.invaders[index].position
+                self.invaders[index].diveAttack.progress = 0
+                self.invaders[index].diveAttack.phase = 0
+                self.invaders[index].diveAttack.spinSpeed = Double.random(in: 8...15) * (Bool.random() ? 1 : -1)
+                self.invaders[index].diveAttack.targetPosition = CGPoint(
+                    x: self.player.position.x + CGFloat.random(in: -100...100),
+                    y: self.screenHeight - 150
+                )
+            }
+        }
+    }
+    
+    func updateDiveAttack(index: Int, deltaTime: Double) {
+        // Very slow dive speed
+        let speed = 0.35 + Double(wave) * 0.02
+        invaders[index].diveAttack.progress += deltaTime * speed
+        invaders[index].diveAttack.angle += invaders[index].diveAttack.spinSpeed * deltaTime
+        
+        let progress = invaders[index].diveAttack.progress
+        let start = invaders[index].diveAttack.startPosition
+        let target = invaders[index].diveAttack.targetPosition
+        
+        // Continuous fluid motion - all in one progress from 0 to 1
+        let t = min(1.0, progress)
+        
+        // Shoot once at the bottom of the dive
+        if t > 0.35 && t < 0.4 {
+            let bullet = Bullet(
+                position: invaders[index].position,
+                velocity: CGPoint(x: CGFloat.random(in: -1...1), y: GameConstants.invaderBulletSpeed),
+                isPlayerBullet: false,
+                color: RetroColors.neonOrange
+            )
+            if !invaderBullets.contains(where: { 
+                abs($0.position.x - bullet.position.x) < 50 && abs($0.position.y - bullet.position.y) < 50 
+            }) {
+                invaderBullets.append(bullet)
+            }
+        }
+        
+        // Fluid continuous path: down, swoop, up - all in one smooth motion
+        let swoopDirection: CGFloat = invaders[index].diveAttack.spinSpeed > 0 ? 1 : -1
+        
+        if t < 0.4 {
+            // Phase 1: Dive down (0 to 0.4)
+            let phaseT = t / 0.4
+            let curveX = sin(phaseT * .pi) * 100 * swoopDirection
+            invaders[index].position.x = start.x + (target.x - start.x) * CGFloat(phaseT) + CGFloat(curveX)
+            invaders[index].position.y = start.y + (target.y - start.y) * CGFloat(phaseT)
+        } else if t < 0.6 {
+            // Phase 2: Swoop across bottom (0.4 to 0.6)
+            let phaseT = (t - 0.4) / 0.2
+            let swoopDistance: CGFloat = 120
+            invaders[index].position.x = target.x + swoopDirection * swoopDistance * CGFloat(phaseT)
+            invaders[index].position.y = target.y + CGFloat(sin(phaseT * .pi)) * 20
+        } else {
+            // Phase 3: Return up to CURRENT grid position (0.6 to 1.0)
+            let phaseT = (t - 0.6) / 0.4
+            let swoopEndX = target.x + swoopDirection * 120
+            let arcHeight = CGFloat(sin(phaseT * .pi)) * 60
+            // Read gridPosition directly each frame to get updated position
+            let currentGridPos = invaders[index].gridPosition
+            invaders[index].position.x = swoopEndX + (currentGridPos.x - swoopEndX) * CGFloat(phaseT)
+            invaders[index].position.y = target.y + (currentGridPos.y - target.y) * CGFloat(phaseT) - arcHeight
+        }
+        
+        if t >= 1.0 {
+            invaders[index].diveAttack.isDiving = false
+            invaders[index].diveAttack.phase = 0
+            invaders[index].diveAttack.angle = 0
+            // Snap to current grid position when dive ends
+            invaders[index].position = invaders[index].gridPosition
+        }
+        
+        // Spawn trail particles while diving
+        if invaders[index].diveAttack.phase < 2 && Int(gameTime * 20) % 2 == 0 {
+            spawnParticles(at: invaders[index].position, type: .trail, count: 1, color: RetroColors.neonOrange)
+        }
+    }
+    
     func moveInvaders() {
         var shouldDropAndReverse = false
         
-        for invader in invaders where invader.isAlive {
+        for invader in invaders where invader.isAlive && !invader.diveAttack.isDiving {
             let nextX = invader.position.x + invaderDirection * GameConstants.invaderMoveSpeed
             if nextX < GameConstants.invaderSize || nextX > screenWidth - GameConstants.invaderSize {
                 shouldDropAndReverse = true
@@ -481,17 +779,29 @@ class GameEngine {
         if shouldDropAndReverse {
             invaderDirection *= -1
             for i in invaders.indices {
-                invaders[i].position.y += GameConstants.invaderDropAmount
+                // Always update grid position (even for diving invaders)
+                invaders[i].gridPosition.y += GameConstants.invaderDropAmount
+                
+                // Only move position if not diving
+                if !invaders[i].diveAttack.isDiving {
+                    invaders[i].position.y += GameConstants.invaderDropAmount
+                }
                 
                 // Check if invaders reached player
-                if invaders[i].isAlive && invaders[i].position.y > screenHeight - 120 {
+                if invaders[i].isAlive && !invaders[i].diveAttack.isDiving && invaders[i].position.y > screenHeight - 120 {
                     gameOver()
                     return
                 }
             }
         } else {
             for i in invaders.indices {
-                invaders[i].position.x += invaderDirection * GameConstants.invaderMoveSpeed
+                // Always update grid position (even for diving invaders)
+                invaders[i].gridPosition.x += invaderDirection * GameConstants.invaderMoveSpeed
+                
+                // Only move position if not diving
+                if !invaders[i].diveAttack.isDiving {
+                    invaders[i].position.x += invaderDirection * GameConstants.invaderMoveSpeed
+                }
             }
         }
     }
@@ -858,15 +1168,24 @@ struct InvaderView: View {
     
     var body: some View {
         let sprite = InvaderSprites.sprite(type: invader.type, frame: invader.animationFrame)
-        let baseColor = InvaderSprites.color(type: invader.type)
+        let baseColor = invader.diveAttack.isDiving ? RetroColors.neonOrange : InvaderSprites.color(type: invader.type)
         
         ZStack {
+            // Dive trail glow
+            if invader.diveAttack.isDiving {
+                Circle()
+                    .fill(RetroColors.neonOrange)
+                    .frame(width: GameConstants.invaderSize * 1.5, height: GameConstants.invaderSize * 1.5)
+                    .blur(radius: 15)
+                    .opacity(0.6)
+            }
+            
             // Glow effect
             PixelShape(pixels: sprite)
                 .fill(baseColor)
                 .frame(width: GameConstants.invaderSize + 8, height: GameConstants.invaderSize + 8)
-                .blur(radius: 8)
-                .opacity(0.5 + 0.2 * sin(gameTime * 5))
+                .blur(radius: invader.diveAttack.isDiving ? 12 : 8)
+                .opacity(invader.diveAttack.isDiving ? 0.8 : 0.5 + 0.2 * sin(gameTime * 5))
             
             // Main sprite
             PixelShape(pixels: sprite)
@@ -884,6 +1203,8 @@ struct InvaderView: View {
                 )
                 .frame(width: GameConstants.invaderSize, height: GameConstants.invaderSize)
         }
+        .rotationEffect(.degrees(invader.diveAttack.angle))
+        .scaleEffect(invader.diveAttack.isDiving ? 1.2 : 1.0)
         .position(invader.position)
     }
 }
