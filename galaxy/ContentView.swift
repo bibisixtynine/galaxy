@@ -858,7 +858,6 @@ class GameEngine {
     
     func playerShoot() {
         guard gameState == .playing else { return }
-        guard playerBullets.count < 3 else { return }
         
         let bullet = Bullet(
             position: CGPoint(x: player.position.x, y: player.position.y - 20),
