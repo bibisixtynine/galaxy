@@ -13,5 +13,6 @@ struct galaxyApp: App {
         WindowGroup {
             ContentView()
         }
+        .windowStyle(.hiddenTitleBar)
     }
 }
