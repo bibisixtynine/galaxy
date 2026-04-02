@@ -279,6 +279,114 @@ class SoundEngine {
         }
     }
     
+    func playIntergalacticExplosion() {
+        guard isReady, let format = format else { return }
+        
+        // Phase 1: Deep rumbling bass explosion (long, dramatic)
+        let sampleRate = format.sampleRate
+        let channelCount = Int(format.channelCount)
+        let duration = 2.5
+        let frameCount = Int(duration * sampleRate)
+        
+        guard frameCount > 0,
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frameCount)),
+              let channelData = buffer.floatChannelData else { return }
+        
+        buffer.frameLength = AVAudioFrameCount(frameCount)
+        
+        for frame in 0..<frameCount {
+            let time = Double(frame) / sampleRate
+            let progress = time / duration
+            
+            // Layer 1: Deep sub-bass rumble that drops in pitch
+            let bassFreq = 80.0 * (1.0 - progress * 0.6)
+            let bass = sin(time * bassFreq * 2 * .pi) * 0.3
+            
+            // Layer 2: Mid noise explosion burst
+            let noise = Double(Float.random(in: -1...1))
+            let noiseEnv = max(0, 1.0 - progress * 1.5)
+            let noisePart = noise * noiseEnv * noiseEnv * 0.4
+            
+            // Layer 3: Rising whistle/beam sound
+            let beamFreq = 200.0 + progress * 800.0
+            let beamEnv = progress < 0.3 ? (progress / 0.3) : max(0, 1.0 - (progress - 0.3) / 0.7)
+            let beam = sin(time * beamFreq * 2 * .pi) * beamEnv * 0.15
+            
+            // Layer 4: Metallic ring (harmonic series)
+            let ringEnv = max(0, 1.0 - progress * 0.8)
+            let ring = (sin(time * 440 * 2 * .pi) * 0.5 +
+                        sin(time * 554 * 2 * .pi) * 0.3 +
+                        sin(time * 660 * 2 * .pi) * 0.2) * ringEnv * ringEnv * 0.1
+            
+            // Layer 5: Descending dramatic notes
+            let noteProgress = progress * 4
+            let noteIndex = Int(noteProgress) % 4
+            let noteFreqs = [293.66, 261.63, 220.0, 164.81]  // D4, C4, A3, E3
+            let noteEnv = max(0, 1.0 - (noteProgress - floor(noteProgress)) * 2.0)
+            let notePart = sin(time * noteFreqs[noteIndex] * 2 * .pi) * noteEnv * 0.12 * (progress < 0.8 ? 1.0 : 0.0)
+            
+            // Overall envelope: sharp attack, long decay
+            let attack = min(1.0, time / 0.01)
+            let decay = max(0, 1.0 - progress * progress * 0.5)
+            let masterVol = attack * decay * 0.8
+            
+            let sample = Float((bass + noisePart + beam + ring + notePart) * masterVol)
+            
+            for channel in 0..<channelCount {
+                channelData[channel][frame] = sample
+            }
+        }
+        
+        // Use multiple nodes for the big explosion sound
+        let node = playerNodes[currentNodeIndex]
+        currentNodeIndex = (currentNodeIndex + 1) % nodeCount
+        
+        if node.isPlaying {
+            node.stop()
+        }
+        
+        node.scheduleBuffer(buffer, at: nil, options: [], completionHandler: nil)
+        node.play()
+        
+        // Additional crackle overlay on another node
+        let crackleDuration = 1.5
+        let crackleFrameCount = Int(crackleDuration * sampleRate)
+        guard crackleFrameCount > 0,
+              let crackleBuffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(crackleFrameCount)),
+              let crackleData = crackleBuffer.floatChannelData else { return }
+        
+        crackleBuffer.frameLength = AVAudioFrameCount(crackleFrameCount)
+        
+        for frame in 0..<crackleFrameCount {
+            let time = Double(frame) / sampleRate
+            let progress = time / crackleDuration
+            
+            // Random crackle pops
+            var sample: Float = 0
+            if Float.random(in: 0...1) < Float(0.3 * (1.0 - progress)) {
+                sample = Float.random(in: -0.5...0.5) * Float(1.0 - progress)
+            }
+            // Filtered rumble
+            let rumble = sin(time * 40 * 2 * .pi) * (1.0 - progress) * 0.2
+            sample += Float(rumble)
+            sample *= Float(0.5)
+            
+            for channel in 0..<channelCount {
+                crackleData[channel][frame] = sample
+            }
+        }
+        
+        let crackleNode = playerNodes[currentNodeIndex]
+        currentNodeIndex = (currentNodeIndex + 1) % nodeCount
+        
+        if crackleNode.isPlaying {
+            crackleNode.stop()
+        }
+        
+        crackleNode.scheduleBuffer(crackleBuffer, at: nil, options: [], completionHandler: nil)
+        crackleNode.play()
+    }
+    
     func playMenuSelect() {
         playTone(frequency: 660, duration: 0.08, type: .square, decay: false)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
@@ -388,6 +496,7 @@ enum ParticleType {
     case debris
     case shockwave
     case star
+    case shipFragment  // Piece of the player ship breaking apart
 }
 
 // MARK: - Particle Model
@@ -496,6 +605,7 @@ struct FlashEffect {
 enum GameState {
     case menu
     case playing
+    case dying        // Explosion plays, game keeps running
     case gameOver
     case victory
 }
@@ -523,6 +633,9 @@ class GameEngine {
     var stars: [Particle] = []
     var lastDiveAttack: Double = 0
     var diveAttackCooldown: Double = 8.0
+    var dyingTimer: Double = 0          // Countdown during dying state
+    var dyingPhase: Int = 0             // Tracks which wave of the explosion we're in
+    var showGameOverPanel: Bool = false  // Show game over UI after explosion finishes
     
     // Cached filtered arrays for performance
     var aliveInvaders: [Invader] { invaders.filter { $0.isAlive } }
@@ -563,6 +676,9 @@ class GameEngine {
         score = 0
         wave = 1
         combo = 0
+        dyingTimer = 0
+        dyingPhase = 0
+        showGameOverPanel = false
         player = Player(position: CGPoint(x: screenWidth / 2, y: screenHeight - 80))
         playerBullets = []
         invaderBullets = []
@@ -607,6 +723,86 @@ class GameEngine {
                 stars[i].position.x = CGFloat.random(in: 0...screenWidth)
             }
             stars[i].alpha = 0.3 + 0.7 * (0.5 + 0.5 * sin(gameTime * 3 + Double(i)))
+        }
+        
+        // Handle dying state: game keeps running but player is gone
+        if gameState == .dying {
+            dyingTimer += deltaTime
+            
+            // Phased explosion waves over time
+            if dyingPhase == 0 && dyingTimer >= 0.5 {
+                dyingPhase = 1
+                createIntergalacticExplosion(at: player.position, phase: 1)
+            }
+            if dyingPhase == 1 && dyingTimer >= 1.3 {
+                dyingPhase = 2
+                createIntergalacticExplosion(at: player.position, phase: 2)
+            }
+            if dyingPhase == 2 && dyingTimer >= 2.5 {
+                dyingPhase = 3
+                createIntergalacticExplosion(at: player.position, phase: 3)
+            }
+            if dyingPhase == 3 && dyingTimer >= 3.8 {
+                dyingPhase = 4
+                flashEffect.trigger(color: RetroColors.neonPink)
+                screenShake.trigger(intensity: 20)
+            }
+            
+            // Continuous fire particles streaming from the wreck
+            if dyingTimer < 3.2 {
+                // Spawn rate ramps up then down
+                let rate: Int
+                if dyingTimer < 0.5 { rate = 3 }
+                else if dyingTimer < 1.3 { rate = 5 }
+                else if dyingTimer < 2.5 { rate = 8 }
+                else { rate = 3 }
+                
+                let spread = CGFloat(min(dyingTimer * 20, 60))
+                spawnFireParticles(at: player.position, type: .spark, count: rate,
+                                   speedRange: 1...8, lifetimeRange: 0.3...1.2, spread: spread)
+                
+                // Smooth continuous shake
+                let shakeAmount: CGFloat = dyingTimer < 1.3 ? 10 : (dyingTimer < 2.5 ? 18 : 5)
+                screenShake.trigger(intensity: shakeAmount)
+                
+                // Subtle warm flash pulses (not rainbow seizure)
+                let flashPulse = 0.06 + 0.06 * sin(gameTime * 8)
+                if flashEffect.alpha < flashPulse {
+                    flashEffect.alpha = flashPulse
+                    flashEffect.color = [RetroColors.neonOrange, RetroColors.neonYellow, RetroColors.neonPink][Int(gameTime * 3) % 3]
+                }
+            }
+            
+            // After the explosion finishes, show the game over panel
+            if dyingTimer >= 4.5 && !showGameOverPanel {
+                showGameOverPanel = true
+                gameState = .gameOver
+                SoundEngine.shared.playGameOver()
+            }
+            
+            // Invaders keep moving and shooting during dying
+            invaderMoveTimer += deltaTime
+            let moveInterval = max(0.1, 0.8 - Double(wave) * 0.05 - Double(55 - invaders.filter { $0.isAlive }.count) * 0.01)
+            if invaderMoveTimer >= moveInterval {
+                invaderMoveTimer = 0
+                moveInvaders()
+            }
+            for i in invaders.indices {
+                if Int(gameTime * 4) % 2 == 0 {
+                    invaders[i].animationFrame = (invaders[i].animationFrame + 1) % 2
+                }
+                if invaders[i].diveAttack.isDiving {
+                    updateDiveAttack(index: i, deltaTime: deltaTime)
+                }
+            }
+            lastInvaderShot += deltaTime
+            let shootInterval = max(0.3, 1.5 - Double(wave) * 0.1)
+            if lastInvaderShot >= shootInterval {
+                lastInvaderShot = 0
+                invaderShoot()
+            }
+            updateBullets()
+            return
         }
         
         // Stop game logic if not playing
@@ -898,15 +1094,30 @@ class GameEngine {
     func updateParticles(deltaTime: Double) {
         for i in particles.indices.reversed() {
             particles[i].lifetime -= deltaTime
-            particles[i].position.x += particles[i].velocity.x
-            particles[i].position.y += particles[i].velocity.y
-            particles[i].velocity.y += 0.2 // gravity
             particles[i].rotation += particles[i].rotationSpeed
-            particles[i].alpha = particles[i].progress
             
-            if particles[i].type == .shockwave {
+            switch particles[i].type {
+            case .shockwave:
                 particles[i].size += 8
                 particles[i].alpha = particles[i].progress * 0.6
+                
+            case .shipFragment:
+                particles[i].position.x += particles[i].velocity.x
+                particles[i].position.y += particles[i].velocity.y
+                particles[i].velocity.y += 0.12
+                particles[i].velocity.x *= 0.998
+                let p = particles[i].progress
+                particles[i].alpha = p > 0.2 ? 1.0 : p / 0.2
+                // Flicker near end of life
+                if p < 0.15 {
+                    particles[i].alpha *= sin(gameTime * 20 + Double(i) * 7) > 0 ? 1.0 : 0.3
+                }
+                
+            default:
+                particles[i].position.x += particles[i].velocity.x
+                particles[i].position.y += particles[i].velocity.y
+                particles[i].velocity.y += 0.2
+                particles[i].alpha = particles[i].progress
             }
         }
         particles.removeAll { $0.lifetime <= 0 }
@@ -1031,6 +1242,178 @@ class GameEngine {
         }
     }
     
+    // Fire-colored particle burst helper
+    func spawnFireParticles(at position: CGPoint, type: ParticleType, count: Int, speedRange: ClosedRange<CGFloat>, lifetimeRange: ClosedRange<Double>, spread: CGFloat = 0) {
+        let fireColors: [Color] = [
+            RetroColors.neonOrange, RetroColors.neonYellow, RetroColors.neonPink,
+            Color(red: 1.0, green: 0.3, blue: 0.1), // deep orange
+            Color(red: 1.0, green: 0.7, blue: 0.2), // amber
+            .white
+        ]
+        for _ in 0..<count {
+            let angle = Double.random(in: 0...(.pi * 2))
+            let speed = CGFloat.random(in: speedRange)
+            let origin = CGPoint(
+                x: position.x + CGFloat.random(in: -spread...spread),
+                y: position.y + CGFloat.random(in: -spread...spread)
+            )
+            particles.append(Particle(
+                position: origin,
+                velocity: CGPoint(
+                    x: cos(angle) * speed,
+                    y: sin(angle) * speed - (type == .explosion ? 2 : 0)
+                ),
+                color: fireColors.randomElement()!,
+                size: type == .spark ? CGFloat.random(in: 2...4) : CGFloat.random(in: 3...7),
+                lifetime: Double.random(in: lifetimeRange),
+                maxLifetime: lifetimeRange.upperBound,
+                rotation: Double.random(in: 0...360),
+                rotationSpeed: Double.random(in: -10...10),
+                type: type
+            ))
+        }
+    }
+    
+    func createIntergalacticExplosion(at position: CGPoint, phase: Int) {
+        switch phase {
+        case 0:
+            // === PHASE 0: Ship shatters — fragments fly out + initial fire burst ===
+            
+            // Ship fragments — real PixelShape pieces tumbling away
+            let fragmentAngles: [Double] = [
+                -.pi * 0.5,   // top spike goes up
+                -.pi * 0.85,  // left wing goes upper-left
+                -.pi * 0.15,  // right wing goes upper-right
+                .pi,          // center body goes left
+                .pi * 0.65,   // left engine goes down-left
+                .pi * 0.35    // right engine goes down-right
+            ]
+            for (i, _) in PlayerSprite.fragments.enumerated() {
+                let angle = fragmentAngles[i] + Double.random(in: -0.2...0.2)
+                let speed = CGFloat.random(in: 2.5...4.5)
+                particles.append(Particle(
+                    position: position,
+                    velocity: CGPoint(x: cos(angle) * speed, y: sin(angle) * speed),
+                    color: [RetroColors.neonGreen, RetroColors.neonBlue].randomElement()!,
+                    size: CGFloat.random(in: 18...28),
+                    lifetime: 4.0,
+                    maxLifetime: 4.0,
+                    rotation: Double(i) * 60,
+                    rotationSpeed: Double.random(in: -5...5),
+                    type: .shipFragment
+                ))
+            }
+            
+            // Initial fire burst — same style as invader explosions but bigger
+            spawnFireParticles(at: position, type: .explosion, count: 40, speedRange: 3...10, lifetimeRange: 0.4...1.2)
+            spawnFireParticles(at: position, type: .spark, count: 30, speedRange: 4...12, lifetimeRange: 0.3...1.0)
+            spawnParticles(at: position, type: .debris, count: 15, color: RetroColors.retroWhite)
+            
+            // Shockwave
+            particles.append(Particle(
+                position: position, velocity: .zero,
+                color: RetroColors.neonGreen,
+                size: 10, lifetime: 0.5, maxLifetime: 0.5,
+                rotation: 0, rotationSpeed: 0, type: .shockwave
+            ))
+            
+            screenShake.trigger(intensity: 35)
+            flashEffect.trigger(color: .white)
+            
+        case 1:
+            // === PHASE 1: Secondary explosion (0.5s) — fire erupts from wreckage ===
+            
+            spawnFireParticles(at: position, type: .explosion, count: 60, speedRange: 2...12, lifetimeRange: 0.5...1.5, spread: 20)
+            spawnFireParticles(at: position, type: .spark, count: 50, speedRange: 5...16, lifetimeRange: 0.3...1.2, spread: 15)
+            spawnParticles(at: position, type: .debris, count: 20, color: RetroColors.neonOrange)
+            
+            // Shockwave
+            particles.append(Particle(
+                position: position, velocity: .zero,
+                color: RetroColors.neonOrange,
+                size: 10, lifetime: 0.6, maxLifetime: 0.6,
+                rotation: 0, rotationSpeed: 0, type: .shockwave
+            ))
+            
+            screenShake.trigger(intensity: 45)
+            flashEffect.trigger(color: RetroColors.neonOrange)
+            
+            // Kill nearby invaders
+            for i in invaders.indices where invaders[i].isAlive {
+                let dx = invaders[i].position.x - position.x
+                let dy = invaders[i].position.y - position.y
+                if sqrt(dx*dx + dy*dy) < 180 {
+                    invaders[i].isAlive = false
+                    createExplosion(at: invaders[i].position, intensity: 2)
+                }
+            }
+            
+        case 2:
+            // === PHASE 2: THE BIG ONE (1.3s) — massive fireball ===
+            
+            // Massive explosion particle burst
+            spawnFireParticles(at: position, type: .explosion, count: 100, speedRange: 3...18, lifetimeRange: 0.8...2.0, spread: 30)
+            spawnFireParticles(at: position, type: .spark, count: 80, speedRange: 6...22, lifetimeRange: 0.4...1.5, spread: 20)
+            spawnParticles(at: position, type: .debris, count: 30, color: RetroColors.neonYellow)
+            spawnParticles(at: position, type: .debris, count: 20, color: RetroColors.retroWhite)
+            
+            // Multiple shockwaves
+            for i in 0..<3 {
+                particles.append(Particle(
+                    position: position, velocity: .zero,
+                    color: [.white, RetroColors.neonYellow, RetroColors.neonPink][i],
+                    size: 10, lifetime: 0.6 + Double(i) * 0.1, maxLifetime: 0.9,
+                    rotation: 0, rotationSpeed: 0, type: .shockwave
+                ))
+            }
+            
+            screenShake.trigger(intensity: 60)
+            flashEffect.trigger(color: .white)
+            
+            // Kill invaders in wide radius
+            for i in invaders.indices where invaders[i].isAlive {
+                let dx = invaders[i].position.x - position.x
+                let dy = invaders[i].position.y - position.y
+                if sqrt(dx*dx + dy*dy) < 350 {
+                    invaders[i].isAlive = false
+                    createExplosion(at: invaders[i].position, intensity: 2)
+                }
+            }
+            
+        case 3:
+            // === PHASE 3: Aftermath — embers rain down (2.5s) ===
+            
+            // Gentle falling embers/sparks from the blast area
+            spawnFireParticles(at: position, type: .spark, count: 60, speedRange: 0.5...4, lifetimeRange: 1.5...3.5, spread: 120)
+            spawnFireParticles(at: position, type: .explosion, count: 30, speedRange: 0.5...3, lifetimeRange: 1.0...3.0, spread: 100)
+            
+            // Debris floating
+            for _ in 0..<25 {
+                let angle = Double.random(in: 0...(.pi * 2))
+                let speed = CGFloat.random(in: 0.5...3)
+                particles.append(Particle(
+                    position: CGPoint(
+                        x: position.x + CGFloat.random(in: -100...100),
+                        y: position.y + CGFloat.random(in: -60...30)
+                    ),
+                    velocity: CGPoint(x: cos(angle) * speed, y: sin(angle) * speed),
+                    color: [RetroColors.neonGreen, RetroColors.neonBlue, RetroColors.retroWhite].randomElement()!,
+                    size: CGFloat.random(in: 2...6),
+                    lifetime: Double.random(in: 2.0...4.0),
+                    maxLifetime: 4.0,
+                    rotation: Double.random(in: 0...360),
+                    rotationSpeed: Double.random(in: -8...8),
+                    type: .debris
+                ))
+            }
+            
+            screenShake.trigger(intensity: 8)
+            
+        default:
+            break
+        }
+    }
+    
     func nextWave() {
         wave += 1
         spawnInvaders()
@@ -1047,10 +1430,18 @@ class GameEngine {
     }
     
     func gameOver() {
-        gameState = .gameOver
-        screenShake.trigger(intensity: 30)
-        flashEffect.trigger(color: RetroColors.neonPink)
-        SoundEngine.shared.playGameOver()
+        guard gameState == .playing else { return }
+        gameState = .dying
+        dyingTimer = 0
+        dyingPhase = 0
+        showGameOverPanel = false
+        
+        // Stop music, start the epic explosion
+        SoundEngine.shared.stopMusic()
+        SoundEngine.shared.playIntergalacticExplosion()
+        
+        // Launch phase 0 immediately: initial flash + ship breakup
+        createIntergalacticExplosion(at: player.position, phase: 0)
     }
     
     func movePlayer(to x: CGFloat) {
@@ -1180,6 +1571,36 @@ struct PlayerSprite {
         [1,1,1,1,1,1,1,1,1,1,1],
         [1,1,1,1,1,1,1,1,1,1,1],
         [0,1,1,0,0,0,0,0,1,1,0]
+    ]
+    
+    // Ship broken into fragments for death explosion
+    static let fragments: [[[Int]]] = [
+        // Top spike
+        [[0,0,1,0,0],
+         [0,1,1,1,0],
+         [0,1,1,1,0]],
+        // Left wing
+        [[0,1,1,1,0],
+         [1,1,1,1,0],
+         [1,1,1,0,0],
+         [0,1,1,0,0]],
+        // Right wing
+        [[0,1,1,1,0],
+         [0,1,1,1,1],
+         [0,0,1,1,1],
+         [0,0,1,1,0]],
+        // Center body
+        [[1,1,1],
+         [1,1,1],
+         [1,1,1]],
+        // Left engine
+        [[1,1],
+         [1,1],
+         [1,1]],
+        // Right engine
+        [[1,1],
+         [1,1],
+         [1,1]]
     ]
 }
 
@@ -1322,19 +1743,26 @@ struct ParticleView: View {
             switch particle.type {
             case .shockwave:
                 Circle()
-                    .stroke(particle.color, lineWidth: 3)
+                    .stroke(particle.color, lineWidth: 2)
                     .frame(width: particle.size, height: particle.size)
-                    .blur(radius: 2)
+                    .blur(radius: 1)
                     .opacity(particle.alpha)
                     .position(particle.position)
                 
-            case .explosion, .spark:
+            case .explosion:
                 Circle()
                     .fill(particle.color)
                     .frame(width: particle.size, height: particle.size)
-                    .blur(radius: particle.type == .explosion ? 2 : 1)
+                    .blur(radius: 1)
                     .opacity(particle.alpha)
                     .rotationEffect(.degrees(particle.rotation))
+                    .position(particle.position)
+                
+            case .spark:
+                Circle()
+                    .fill(particle.color)
+                    .frame(width: particle.size, height: particle.size)
+                    .opacity(particle.alpha)
                     .position(particle.position)
                 
             case .debris:
@@ -1349,7 +1777,7 @@ struct ParticleView: View {
                 Circle()
                     .fill(particle.color)
                     .frame(width: particle.size, height: particle.size)
-                    .blur(radius: 3)
+                    .blur(radius: 2)
                     .opacity(particle.alpha * 0.5)
                     .position(particle.position)
                 
@@ -1359,6 +1787,42 @@ struct ParticleView: View {
                     .frame(width: particle.size, height: particle.size)
                     .opacity(particle.alpha)
                     .position(particle.position)
+                
+            case .shipFragment:
+                let fragmentIndex = abs(Int(particle.rotation * 100)) % PlayerSprite.fragments.count
+                ZStack {
+                    // Fire glow trailing behind the fragment
+                    Circle()
+                        .fill(RetroColors.neonOrange)
+                        .frame(width: particle.size * 0.7, height: particle.size * 0.7)
+                        .blur(radius: 6)
+                        .opacity(particle.alpha * 0.5)
+                        .offset(x: -particle.velocity.x * 0.8, y: -particle.velocity.y * 0.8)
+                    
+                    // Glow around the fragment
+                    PixelShape(pixels: PlayerSprite.fragments[fragmentIndex])
+                        .fill(particle.color)
+                        .frame(width: particle.size + 4, height: (particle.size + 4) * 0.8)
+                        .blur(radius: 4)
+                        .opacity(particle.alpha * 0.4)
+                    
+                    // The pixel art fragment
+                    PixelShape(pixels: PlayerSprite.fragments[fragmentIndex])
+                        .fill(particle.color)
+                        .frame(width: particle.size, height: particle.size * 0.8)
+                    
+                    // Hot white highlight
+                    PixelShape(pixels: PlayerSprite.fragments[fragmentIndex])
+                        .fill(.white.opacity(0.4))
+                        .frame(width: particle.size, height: particle.size * 0.8)
+                        .mask(
+                            LinearGradient(colors: [.white, .clear],
+                                           startPoint: .top, endPoint: .center)
+                        )
+                }
+                .rotationEffect(.degrees(particle.rotation))
+                .opacity(particle.alpha)
+                .position(particle.position)
             }
         }
     }
@@ -1722,7 +2186,7 @@ struct GameView: View {
                         .allowsHitTesting(false)
                     
                     // HUD
-                    if engine.gameState == .playing {
+                    if engine.gameState == .playing || engine.gameState == .dying {
                         HUDView(
                             score: engine.score,
                             highScore: engine.highScore,
@@ -1741,8 +2205,8 @@ struct GameView: View {
                         }
                     }
                     
-                    // Game over overlay
-                    if engine.gameState == .gameOver || engine.gameState == .victory {
+                    // Game over overlay (only after explosion finishes)
+                    if engine.showGameOverPanel || engine.gameState == .victory {
                         Color.black.opacity(0.5)
                         
                         GameOverView(
